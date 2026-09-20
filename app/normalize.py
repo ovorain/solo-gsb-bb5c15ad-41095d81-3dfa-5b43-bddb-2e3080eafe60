@@ -37,6 +37,10 @@ class IssueCode(str, Enum):
     COLLISION = "COLLISION"
     BLOCKED_BY_FILE_ANCESTOR = "BLOCKED_BY_FILE_ANCESTOR"
     BLOCKS_DESCENDANT = "BLOCKS_DESCENDANT"
+    LINK_TARGET_ESCAPE = "LINK_TARGET_ESCAPE"
+    LINK_TARGET_INVALID = "LINK_TARGET_INVALID"
+    LINK_CYCLE = "LINK_CYCLE"
+    SYMLINK_ANCESTOR = "SYMLINK_ANCESTOR"
 
 
 _ERROR_CODES = frozenset(
@@ -48,6 +52,10 @@ _ERROR_CODES = frozenset(
         IssueCode.RESERVED_NAME,
         IssueCode.INVALID_CHARACTER,
         IssueCode.EMPTY_TARGET,
+        IssueCode.LINK_TARGET_ESCAPE,
+        IssueCode.LINK_TARGET_INVALID,
+        IssueCode.LINK_CYCLE,
+        IssueCode.SYMLINK_ANCESTOR,
     }
 )
 
@@ -94,10 +102,19 @@ def _is_reserved(stem: str) -> bool:
     return False
 
 
-def normalize_entry(index: int, entry_type: str, original_path: str) -> NormalizedEntry:
+def normalize_entry(
+    index: int,
+    entry_type: str,
+    original_path: str,
+    initial_parts: tuple[str, ...] = (),
+) -> NormalizedEntry:
     """按 Windows 目标规则规范化单条条目路径。
 
     全部处理均为词法/内存计算，不读取文件系统。
+
+    ``initial_parts`` 非空时作为解析基准目录（用于符号链接目标相对链接所在
+    目录解析）：``..`` 先弹出基准段，基准弹空后再弹才算越界；此时结果为空
+    表示解析到目标根本身，不视为 ``EMPTY_TARGET``。
     """
     result = NormalizedEntry(
         index=index, entry_type=entry_type, original_path=original_path
@@ -142,7 +159,7 @@ def normalize_entry(index: int, entry_type: str, original_path: str) -> Normaliz
 
     # 3) 切段。前导分隔符产生的空段忽略；内部/结尾空段属于折叠分隔符。
     raw_segments = unified.split("/")
-    stack: list[str] = []
+    stack: list[str] = list(initial_parts)
     collapsed = False
 
     for seg_index, raw_seg in enumerate(raw_segments, start=1):
@@ -227,7 +244,7 @@ def normalize_entry(index: int, entry_type: str, original_path: str) -> Normaliz
     result.canonical_parts = stack
     result.key_parts = [p.casefold() for p in stack]
 
-    if not stack:
+    if not stack and not initial_parts:
         err(
             IssueCode.EMPTY_TARGET,
             "规范化后路径为空（无任何有效段），无法解包为有效目标",

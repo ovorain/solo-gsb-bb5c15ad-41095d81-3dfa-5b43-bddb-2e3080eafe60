@@ -1,8 +1,9 @@
 # Archive Path Preflight API（压缩包路径预检 API）
 
 使用 **Python + FastAPI + 纯内存计算** 的跨平台压缩包路径预检服务。
-接收待解包条目的原始路径与 `file` / `directory` 类型，按 **Windows 目标规则**
+接收待解包条目的原始路径与 `file` / `directory` / `symlink` 类型，按 **Windows 目标规则**
 规范化路径，识别危险条目，并输出同名碰撞组与文件-目录层级冲突；
+符号链接条目额外做**风险分析**：目标越界、链接链循环与祖先路径劫持；
 请求体传 `"repair": true` 还可得到确定性的改名修复计划（`repair_plan`）。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
@@ -57,13 +58,15 @@ pytest -q
     { "path": "docs/readme.txt", "type": "file" },
     { "path": "../evil.bin", "type": "file" },
     { "path": "a/b", "type": "file" },
-    { "path": "a/b/c.txt", "type": "file" }
+    { "path": "a/b/c.txt", "type": "file" },
+    { "path": "docs/link", "type": "symlink", "link_target": "../../etc/passwd" }
   ],
   "repair": false
 }
 ```
 
-`type` 仅接受 `file` 或 `directory`。`repair` 为可选布尔值，省略或为 `false`
+`type` 接受 `file`、`directory` 或 `symlink`；`symlink` 条目**必须**携带
+`link_target`，其余类型不得携带（否则返回 422）。`repair` 为可选布尔值，省略或为 `false`
 时响应与旧版完全一致（不含 `repair_plan` 字段）；为 `true` 时额外返回
 确定性修复计划，见下文 [修复计划（repair=true）](#修复计划repairtrue)。
 响应中的 `entries` **严格保持输入顺序**，`index` 从 1 开始。
@@ -73,15 +76,17 @@ pytest -q
 | 字段 | 说明 |
 | --- | --- |
 | `entries[].canonical_path` | 规范路径：正斜杠 `/` 分隔、每段 Unicode NFC、段尾空格与句点已裁剪，保留原始大小写用于展示 |
+| `entries[].link_target` | 符号链接目标（仅 `symlink` 条目有值，其余为 `null`） |
 | `entries[].comparison_key` | Windows 等价比较键（在规范路径上做大小写折叠 `casefold`）；不安全条目为 `null` |
 | `entries[].safe` | 是否可安全解包 |
 | `entries[].collision_group` | 所属同名碰撞组编号，无碰撞为 `null` |
 | `entries[].blocked_by_file_ancestors` | 占据本条目祖先路径的文件条目下标（层级冲突） |
 | `entries[].blocks_descendants` | 本文件条目阻挡了哪些后代条目（仅文件条目） |
-| `entries[].issues` | 规范化过程中的问题（`severity` 为 `error` 或 `info`） |
+| `entries[].issues` | 规范化与符号链接风险分析过程中的问题（`severity` 为 `error` 或 `info`） |
 | `collision_groups` | 碰撞组明细（含每个成员的下标与规范路径），按首次出现顺序编号 |
 | `hierarchy_conflicts` | `(file_index, descendant_index)` 层级冲突对 |
-| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts` 计数 |
+| `symlink_analysis` | 符号链接风险分析（见下文），无链接时各列表为空 |
+| `summary` | `total / safe / unsafe / collisions / collision_entries / hierarchy_conflicts / symlinks / symlink_cycles / symlink_hijacked` 计数 |
 
 curl 示例：
 
@@ -119,6 +124,10 @@ curl -s http://localhost:8000/api/v1/preflight \
 | `RESERVED_NAME` | 命中 Windows 保留设备名 |
 | `INVALID_CHARACTER` | 含 Windows 非法文件名字符或控制字符 |
 | `EMPTY_TARGET` | 规范化后路径为空 |
+| `LINK_TARGET_ESCAPE` | 符号链接目标（或链接链途经的目标）越出目标根 |
+| `LINK_TARGET_INVALID` | 符号链接目标为空、含非法字符或命中保留设备名 |
+| `LINK_CYCLE` | 链接链存在循环，无法解析到最终目标 |
+| `SYMLINK_ANCESTOR` | 文件/目录的祖先路径被符号链接占据（路径劫持） |
 
 不安全条目仍会返回**尽力而为**的 `canonical_path` 与问题明细，方便展示与修复，
 但**不参与**碰撞分组与层级冲突计算。
@@ -127,9 +136,64 @@ curl -s http://localhost:8000/api/v1/preflight \
 
 - **同名碰撞**：安全条目规范化后的 `comparison_key` 相同即落入同一碰撞组
   （大小写、NFC、段尾点/空格差异都会被抹平），组号按该组首次出现的顺序分配。
-- **层级冲突**：若某**文件**条目的规范路径恰好是另一条目（文件或目录）的
-  祖先路径（如文件 `a/b` 与后代 `a/b/c.txt`），解包时无法在同名路径上创建目录，
-  记为层级冲突。目录占据祖先路径属于正常布局，不报告。
+  符号链接不参与碰撞分组。
+- **层级冲突**：若某**文件**条目的规范路径恰好是另一条目（文件、目录或符号
+  链接）的祖先路径（如文件 `a/b` 与后代 `a/b/c.txt`），解包时无法在同名路径上
+  创建目录，记为层级冲突。目录占据祖先路径属于正常布局，不报告；符号链接
+  占据祖先路径属于路径劫持，见下文符号链接风险分析。
+
+## 符号链接风险分析
+
+`type` 为 `symlink` 的条目必须携带 `link_target`。服务对整批条目做
+**纯词法**的链接风险分析（不访问文件系统），结果集中在响应的
+`symlink_analysis` 字段：
+
+```json
+{
+  "symlink_analysis": {
+    "links": [
+      {
+        "index": 1,
+        "original_path": "a/lnk",
+        "link_target": "../b/lnk2",
+        "resolved_target": "b/lnk2",
+        "final_path": "b/real.txt",
+        "chain": [
+          { "index": 1, "path": "a/lnk" },
+          { "index": 2, "path": "b/lnk2" },
+          { "index": null, "path": "b/real.txt" }
+        ],
+        "risk_codes": [],
+        "safe": true
+      }
+    ],
+    "cycles": [{ "members": [3, 4] }],
+    "hijacked_entries": [
+      { "entry_index": 5, "canonical_path": "a/x.txt", "symlink_ancestors": [1] }
+    ]
+  }
+}
+```
+
+- **目标解析**：`link_target` 以**链接所在目录**为基准，复用与条目路径相同的
+  Windows 规范化规则（分隔符统一、NFC、段尾裁剪、保留名/非法字符检查、
+  词法遍历）。解析结果越出目标根（绝对/UNC/盘符路径，或 `..` 越过根）记
+  `LINK_TARGET_ESCAPE`；目标为空、含非法字符或命中保留设备名记
+  `LINK_TARGET_INVALID`。
+- **链接链追踪**：目标路径（或其中间祖先段）落在批内另一条链接的路径上时
+  继续跟随（大小写折叠匹配），`chain` 依次列出自身、途经链接与最终终点
+  （终点非链接，`index` 为 `null`）。链中再次遇到已访问链接即构成循环
+  （`LINK_CYCLE`，`cycles` 按最小下标起始去重报告）；链途经越界链接时越界
+  **沿链传播**（同样记 `LINK_TARGET_ESCAPE`）。`resolved_target` 为自身目标
+  的根内解析，`final_path` 为全链解析终点（越界或循环时为 `null`）。
+- **路径劫持**：普通 `file` / `directory` 条目的任一祖先路径被符号链接占据，
+  即记 `SYMLINK_ANCESTOR`（`error`），并列入 `hijacked_entries`；被劫持条目
+  视为不安全，退出碰撞分组、层级冲突与 repair 复检。符号链接自身位于另一
+  链接之下时不报劫持。
+- 每条链接的 `risk_codes` 取自 `LINK_TARGET_ESCAPE` / `LINK_TARGET_INVALID` /
+  `LINK_CYCLE`；`links` 严格按输入顺序返回。链接条目**不参与**同名碰撞分组
+  （同键冲突由链接风险分析覆盖），但仍可作为文件祖先阻挡的后代出现在
+  层级冲突中。
 
 ## 修复计划（`repair=true`）
 
@@ -140,8 +204,10 @@ curl -s http://localhost:8000/api/v1/preflight \
 
 修复规则：
 
-1. **只处理安全条目**。不安全条目标记 `"skipped": true`、`repaired_path` 为
-   `null`、`reasons` 为 `["UNSAFE"]`，绝不改名，也不参与碰撞/层级复检。
+1. **只处理安全的 file/directory 条目**。不安全条目标记 `"skipped": true`、
+   `repaired_path` 为 `null`、`reasons` 为 `["UNSAFE"]`，绝不改名，也不参与
+   碰撞/层级复检。**所有符号链接一律 skipped**（`reasons` 为 `["SYMLINK"]`），
+   不参与改名与复检；被符号链接祖先劫持的条目已属不安全，随之一并跳过。
 2. **同名碰撞**：保留碰撞组中**最先出现且自身不阻挡后代**的条目（目录也算），
    其余条目在**末段扩展名前**插入 ` (n)`，n 从 1 递增。若组内所有条目都阻挡
    后代，则无保留者、全部改名。
@@ -191,7 +257,8 @@ curl -s http://localhost:8000/api/v1/preflight \
 | `collisions_resolved` / `hierarchy_conflicts_resolved` | 修复消除的两类冲突数量（分别等于原 `summary.collisions` 与 `summary.hierarchy_conflicts`） |
 
 `reasons` 取值：`COLLISION`（同名碰撞改让）、`BLOCKS_DESCENDANT`
-（文件阻挡后代而改名）、`UNSAFE`（仅 skipped 条目）。
+（文件阻挡后代而改名）、`UNSAFE`（不安全条目，含被符号链接祖先劫持）、
+`SYMLINK`（符号链接，恒 skipped）。
 
 curl 示例：
 
@@ -208,8 +275,9 @@ curl -s http://localhost:8000/api/v1/preflight \
 ├── app/
 │   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan）
-│   ├── service.py       # 碰撞分组与层级冲突编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis）
+│   ├── service.py       # 碰撞分组、层级冲突与符号链接分析编排
+│   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例
 ├── docker/entrypoint.sh # 启动时安装依赖并启动服务

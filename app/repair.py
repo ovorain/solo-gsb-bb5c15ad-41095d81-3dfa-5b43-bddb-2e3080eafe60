@@ -2,7 +2,9 @@
 
 规则（repair=true 时启用）：
 
-* 仅处理安全条目；不安全条目标记 skipped，repaired_path 为 null 且不改名。
+* 仅处理安全的 file/directory 条目；不安全条目标记 skipped，repaired_path
+  为 null 且不改名。符号链接一律 skipped（reasons 为 [SYMLINK]），不参与
+  改名与复检；被符号链接祖先劫持的条目已标记为不安全，随之一并 skipped。
 * 同名碰撞组中保留最先出现且自身不阻挡后代的条目（含目录），其余条目在末段
   扩展名前插入 `` (n)``（n 从 1 递增）。若组内全部阻挡后代，则全部改名。
 * 文件占据祖先路径阻挡后代时，重命名该文件（而不是被阻挡的后代）。
@@ -106,6 +108,10 @@ def build_repair_plan(
         claim_keys.add(parts)
 
     for entry in entries:
+        if entry.entry_type == EntryType.SYMLINK.value:
+            # 符号链接不参与改名与复检，恒为 skipped。
+            reasons[entry.index] = [RepairReason.SYMLINK]
+            continue
         if entry.unsafe:
             reasons[entry.index] = [RepairReason.UNSAFE]
             continue
@@ -160,7 +166,7 @@ def build_repair_plan(
     plan_entries: list[RepairEntry] = []
     for entry in entries:
         idx = entry.index
-        if entry.unsafe:
+        if entry.entry_type == EntryType.SYMLINK.value or entry.unsafe:
             plan_entries.append(
                 RepairEntry(
                     index=idx,
@@ -185,7 +191,7 @@ def build_repair_plan(
             )
         )
 
-    # 按修复后路径复检：不安全条目不参与。
+    # 按修复后路径复检：不安全条目与符号链接不参与（二者本就不在 repaired_parts 中）。
     final_keys = {
         idx: repaired_parts[idx]
         for idx in repaired_parts
@@ -211,7 +217,11 @@ def build_repair_plan(
         for depth in range(1, len(parts)):
             hierarchy_remaining += len(files_by_key.get(parts[:depth], ()))
 
-    skipped_count = sum(1 for e in entries if e.unsafe)
+    skipped_count = sum(
+        1
+        for e in entries
+        if e.unsafe or e.entry_type == EntryType.SYMLINK.value
+    )
     return RepairPlan(
         entries=plan_entries,
         renamed_count=len(renamers),

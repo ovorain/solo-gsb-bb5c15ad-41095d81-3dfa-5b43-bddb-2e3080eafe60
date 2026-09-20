@@ -1,4 +1,4 @@
-"""预检编排：规范化 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
+"""预检编排：规范化 → 符号链接风险分析 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from .schemas import (
     PreflightResponse,
     Summary,
 )
+from .symlink import analyze_symlinks
 
 
 def _add_issue(entry: NormalizedEntry, issue: Issue) -> None:
@@ -30,11 +31,18 @@ def _add_issue(entry: NormalizedEntry, issue: Issue) -> None:
 
 
 def _collision_groups(entries: list[NormalizedEntry]) -> dict[int, int]:
-    """为安全条目按 comparison_key 分组，返回 entry.index -> group 编号。"""
+    """为安全条目按 comparison_key 分组，返回 entry.index -> group 编号。
+
+    符号链接不参与同名碰撞分组（其路径冲突由符号链接风险分析覆盖）。
+    """
     buckets: dict[str, list[NormalizedEntry]] = {}
     first_seen: dict[str, int] = {}
     for entry in entries:
-        if entry.unsafe or entry.comparison_key is None:
+        if (
+            entry.unsafe
+            or entry.comparison_key is None
+            or entry.entry_type == EntryType.SYMLINK.value
+        ):
             continue
         key = entry.comparison_key
         if key not in buckets:
@@ -87,6 +95,15 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
         for i, e in enumerate(request.entries, start=1)
     ]
+
+    # 符号链接风险分析先于碰撞/层级检测：被劫持条目会被标记为不安全，
+    # 从而退出后续碰撞分组、层级冲突与 repair 复检。
+    link_targets = {
+        i: e.link_target
+        for i, e in enumerate(request.entries, start=1)
+        if e.link_target is not None
+    }
+    symlink_analysis = analyze_symlinks(normalized, link_targets)
 
     index_to_group = _collision_groups(normalized)
 
@@ -169,6 +186,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
             index=e.index,
             type=EntryType(e.entry_type),
             original_path=e.original_path,
+            link_target=link_targets.get(e.index),
             canonical_path=e.canonical_path,
             comparison_key=e.comparison_key,
             safe=not e.unsafe,
@@ -197,6 +215,9 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         collisions=len(collision_groups),
         collision_entries=len(index_to_group),
         hierarchy_conflicts=len(hierarchy_out),
+        symlinks=len(symlink_analysis.links),
+        symlink_cycles=len(symlink_analysis.cycles),
+        symlink_hijacked=len(symlink_analysis.hijacked_entries),
     )
 
     if request.repair:
@@ -212,6 +233,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
             entries=entry_out,
             collision_groups=collision_groups,
             hierarchy_conflicts=hierarchy_out,
+            symlink_analysis=symlink_analysis,
             summary=summary,
             repair_plan=repair_plan,
         )
@@ -221,5 +243,6 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         entries=entry_out,
         collision_groups=collision_groups,
         hierarchy_conflicts=hierarchy_out,
+        symlink_analysis=symlink_analysis,
         summary=summary,
     )
