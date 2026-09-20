@@ -1,4 +1,4 @@
-"""预检编排：规范化 → 同名碰撞分组 → 层级冲突检测（纯内存）。"""
+"""预检编排：规范化 → 同名碰撞分组 → 层级冲突检测 → 符号链接风险（纯内存）。"""
 
 from __future__ import annotations
 
@@ -15,11 +15,16 @@ from .schemas import (
     PreflightResponse,
     Summary,
 )
+from .symlinks import analyze_symlinks
 
 
 def _add_issue(entry: NormalizedEntry, issue: Issue) -> None:
     # 避免重复追加同一相关下标的问题。
-    if issue.code in (IssueCode.BLOCKED_BY_FILE_ANCESTOR, IssueCode.BLOCKS_DESCENDANT):
+    if issue.code in (
+        IssueCode.BLOCKED_BY_FILE_ANCESTOR,
+        IssueCode.BLOCKS_DESCENDANT,
+        IssueCode.SYMLINK_ANCESTOR,
+    ):
         for existing in entry.issues:
             if (
                 existing.code == issue.code
@@ -29,12 +34,19 @@ def _add_issue(entry: NormalizedEntry, issue: Issue) -> None:
     entry.issues.append(issue)
 
 
+def _is_symlink(entry: NormalizedEntry) -> bool:
+    return entry.entry_type == EntryType.SYMLINK.value
+
+
 def _collision_groups(entries: list[NormalizedEntry]) -> dict[int, int]:
-    """为安全条目按 comparison_key 分组，返回 entry.index -> group 编号。"""
+    """为安全的普通条目按 comparison_key 分组，返回 entry.index -> group 编号。
+
+    符号链接不参与同名碰撞（其风险走专门的链接分析）。
+    """
     buckets: dict[str, list[NormalizedEntry]] = {}
     first_seen: dict[str, int] = {}
     for entry in entries:
-        if entry.unsafe or entry.comparison_key is None:
+        if entry.unsafe or _is_symlink(entry) or entry.comparison_key is None:
             continue
         key = entry.comparison_key
         if key not in buckets:
@@ -45,11 +57,9 @@ def _collision_groups(entries: list[NormalizedEntry]) -> dict[int, int]:
     # 组号按该组首次出现的下标排序分配。
     ordered_keys = sorted(first_seen, key=lambda k: first_seen[k])
     index_to_group: dict[int, int] = {}
-    group_of_key: dict[str, int] = {}
     for group_no, key in enumerate(ordered_keys, start=1):
         if len(buckets[key]) < 2:
             continue
-        group_of_key[key] = group_no
         for entry in buckets[key]:
             index_to_group[entry.index] = group_no
     return index_to_group
@@ -60,17 +70,18 @@ def _hierarchy_conflicts(
 ) -> list[tuple[NormalizedEntry, NormalizedEntry]]:
     """文件占据祖先路径 → 阻挡同名前缀后代，返回 (文件条目, 后代条目) 对。
 
-    仅对安全条目计算。键为小写折叠后的路径段，故不同大小写/点空格变体也会匹配。
+    仅对安全的普通条目计算（符号链接的祖先占据走路径劫持分析）。
+    键为小写折叠后的路径段，故不同大小写/点空格变体也会匹配。
     """
     files_by_key: dict[str, list[NormalizedEntry]] = {}
     for entry in entries:
-        if entry.unsafe or entry.entry_type != EntryType.FILE.value:
+        if entry.unsafe or _is_symlink(entry) or entry.entry_type != EntryType.FILE.value:
             continue
         files_by_key.setdefault(entry.comparison_key, []).append(entry)
 
     conflicts: list[tuple[NormalizedEntry, NormalizedEntry]] = []
     for descendant in entries:
-        if descendant.unsafe:
+        if descendant.unsafe or _is_symlink(descendant):
             continue
         parts = descendant.key_parts
         for depth in range(1, len(parts)):  # 不含自身（depth == len(parts)）
@@ -83,10 +94,23 @@ def _hierarchy_conflicts(
 
 
 def run_preflight(request: PreflightRequest) -> PreflightResponse:
-    normalized: list[NormalizedEntry] = [
-        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
-        for i, e in enumerate(request.entries, start=1)
-    ]
+    normalized: list[NormalizedEntry] = []
+    for i, e in enumerate(request.entries, start=1):
+        ne = normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        if e.type is EntryType.SYMLINK:
+            ne.link_target = e.link_target
+        normalized.append(ne)
+
+    # 符号链接风险分析（会给被劫持的普通条目追加 SYMLINK_ANCESTOR 信息）。
+    symlink_out, hijack_out, hijacked, hijacks_by_link = analyze_symlinks(normalized)
+
+    # 反向索引：被劫持普通条目下标 -> 占据其祖先的符号链接下标列表。
+    hijackers_of: dict[int, list[int]] = {}
+    for link_index, entry_indices in hijacks_by_link.items():
+        for entry_index in entry_indices:
+            hijackers_of.setdefault(entry_index, []).append(link_index)
+    for indices in hijackers_of.values():
+        indices.sort()
 
     index_to_group = _collision_groups(normalized)
 
@@ -172,9 +196,11 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
             canonical_path=e.canonical_path,
             comparison_key=e.comparison_key,
             safe=not e.unsafe,
+            link_target=e.link_target,
             collision_group=index_to_group.get(e.index),
             blocked_by_file_ancestors=blocked_by.get(e.index, []),
             blocks_descendants=blocks.get(e.index, []),
+            hijacked_by_symlinks=hijackers_of.get(e.index, []),
             issues=[
                 {
                     "code": i.code,
@@ -190,6 +216,8 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
     ]
 
     unsafe_count = sum(1 for e in normalized if e.unsafe)
+    symlink_count = sum(1 for e in normalized if _is_symlink(e))
+    risky_link_count = sum(1 for s in symlink_out if s.risks)
     summary = Summary(
         total=len(normalized),
         safe=len(normalized) - unsafe_count,
@@ -197,21 +225,33 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         collisions=len(collision_groups),
         collision_entries=len(index_to_group),
         hierarchy_conflicts=len(hierarchy_out),
+        symlinks=symlink_count,
+        symlink_risks=risky_link_count,
+        symlink_hijacks=len(hijack_out),
     )
 
     if request.repair:
+        # repair=true：所有 symlink 与被链接祖先劫持的普通条目均 skipped，
+        # 不参与改名与复检（不安全条目同样 skipped）。
+        excluded = set(hijacked)
+        for e in normalized:
+            if _is_symlink(e):
+                excluded.add(e.index)
         repair_plan = build_repair_plan(
             entries=normalized,
             collision_groups=group_members,
             blocks=blocks,
             collisions_total=len(collision_groups),
             hierarchy_total=len(hierarchy_out),
+            excluded=excluded,
         )
         return PreflightRepairResponse(
             target="windows",
             entries=entry_out,
             collision_groups=collision_groups,
             hierarchy_conflicts=hierarchy_out,
+            symlinks=symlink_out,
+            symlink_hijacks=hijack_out,
             summary=summary,
             repair_plan=repair_plan,
         )
@@ -221,5 +261,7 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
         entries=entry_out,
         collision_groups=collision_groups,
         hierarchy_conflicts=hierarchy_out,
+        symlinks=symlink_out,
+        symlink_hijacks=hijack_out,
         summary=summary,
     )

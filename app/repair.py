@@ -2,10 +2,15 @@
 
 规则（repair=true 时启用）：
 
-* 仅处理安全条目；不安全条目标记 skipped，repaired_path 为 null 且不改名。
+* 仅处理安全的普通文件/目录条目；以下条目标记 skipped，不改名、不占名、不参与复检：
+  - 不安全条目（``UNSAFE``）；
+  - 所有符号链接（``SYMLINK``；不安全链接同时带 ``UNSAFE``）；
+  - 被符号链接祖先劫持的普通条目（``SYMLINK_ANCESTOR``）。
 * 同名碰撞组中保留最先出现且自身不阻挡后代的条目（含目录），其余条目在末段
   扩展名前插入 `` (n)``（n 从 1 递增）。若组内全部阻挡后代，则全部改名。
-* 文件占据祖先路径阻挡后代时，重命名该文件（而不是被阻挡的后代）。
+  被跳过的成员不参与保留者选举；剔除跳过后组内至多剩一个成员时无需改名。
+* 文件占据祖先路径阻挡后代时，重命名该文件（而不是被阻挡的后代）；
+  任一方被跳过时该阻挡关系不触发改名。
 * 每个候选名都按 Windows comparison_key（``str.casefold()``）同时检查同名碰撞
   与文件/目录层级冲突（候选不得与已占用路径同名，文件候选不得占据已占用路径的
   祖先、任何候选也不得落在已占用文件路径之下），递增 n 直至整批无冲突。
@@ -63,13 +68,39 @@ def build_repair_plan(
     blocks: dict[int, list[int]],
     collisions_total: int,
     hierarchy_total: int,
+    excluded: frozenset[int] | set[int] | None = None,
 ) -> RepairPlan:
     """根据碰撞分组与层级阻挡关系构造确定性修复计划。
 
     ``collision_groups``: 碰撞组编号 -> 组成员下标列表。
     ``blocks``: 阻挡后代的文件下标 -> 被其阻挡的成员下标列表。
+    ``excluded``: 必须跳过（symlink、被链接祖先劫持）的条目下标集合。
     """
+    excluded = set(excluded or ())
     by_index = {e.index: e for e in entries}
+
+    def skipped_reason(index: int) -> list[RepairReason] | None:
+        """返回跳过原因；参与修复的条目返回 None。"""
+        entry = by_index[index]
+        if entry.unsafe:
+            return [RepairReason.UNSAFE]
+        if entry.entry_type == EntryType.SYMLINK.value:
+            return [RepairReason.SYMLINK]
+        if index in excluded:
+            return [RepairReason.SYMLINK_ANCESTOR]
+        return None
+
+    # 参与修复的活跃条目（安全的普通文件/目录，且未被链接祖先劫持）。
+    active = {e.index for e in entries if skipped_reason(e.index) is None}
+
+    # 仅保留双方均为活跃条目的阻挡关系。
+    active_blocks: dict[int, set[int]] = {}
+    for ancestor, descendants in blocks.items():
+        if ancestor not in active:
+            continue
+        kept = {d for d in descendants if d in active}
+        if kept:
+            active_blocks[ancestor] = kept
 
     # 每个条目至多属于一个碰撞组（comparison_key 唯一），先建下标 -> 组号映射。
     group_of: dict[int, int] = {}
@@ -77,11 +108,17 @@ def build_repair_plan(
         for idx in members:
             group_of[idx] = group_no
 
-    # 组内保留者：最先出现且自身不阻挡任何后代的成员。
+    # 组内保留者：活跃成员中最先出现且自身不阻挡任何活跃后代的成员。
     winners: dict[int, int] = {}
+    dissolved_groups: set[int] = set()
     for group_no, members in collision_groups.items():
-        for idx in sorted(members):
-            if idx not in blocks:
+        active_members = [idx for idx in sorted(members) if idx in active]
+        if len(active_members) < 2:
+            # 剔除跳过条目后已无碰撞：唯一存活者（或无人）保留原名。
+            dissolved_groups.add(group_no)
+            continue
+        for idx in active_members:
+            if idx not in active_blocks:
                 winners[group_no] = idx
                 break
 
@@ -106,15 +143,19 @@ def build_repair_plan(
         claim_keys.add(parts)
 
     for entry in entries:
-        if entry.unsafe:
-            reasons[entry.index] = [RepairReason.UNSAFE]
+        skip = skipped_reason(entry.index)
+        if skip is not None:
+            reasons[entry.index] = skip
             continue
         parts = tuple(entry.key_parts)
         entry_reasons: list[RepairReason] = []
         group_no = group_of.get(entry.index)
-        if group_no is not None and winners.get(group_no) != entry.index:
-            entry_reasons.append(RepairReason.COLLISION)
-        if entry.index in blocks:
+        if group_no is not None and group_no not in dissolved_groups:
+            # 组内多个活跃成员而本条目不是保留者；
+            # 组无保留者（全部阻挡后代）时所有成员都改名。
+            if winners.get(group_no) != entry.index:
+                entry_reasons.append(RepairReason.COLLISION)
+        if entry.index in active_blocks:
             entry_reasons.append(RepairReason.BLOCKS_DESCENDANT)
         reasons[entry.index] = entry_reasons
 
@@ -160,18 +201,19 @@ def build_repair_plan(
     plan_entries: list[RepairEntry] = []
     for entry in entries:
         idx = entry.index
-        if entry.unsafe:
-            plan_entries.append(
-                RepairEntry(
-                    index=idx,
-                    original_path=entry.original_path,
-                    repaired_path=None,
-                    reasons=reasons[idx],
-                    skipped=True,
-                )
-            )
-            continue
         if reasons[idx]:
+            is_skip = skipped_reason(idx) is not None
+            if is_skip:
+                plan_entries.append(
+                    RepairEntry(
+                        index=idx,
+                        original_path=entry.original_path,
+                        repaired_path=None,
+                        reasons=reasons[idx],
+                        skipped=True,
+                    )
+                )
+                continue
             repaired = display_path(idx)
         else:
             repaired = entry.canonical_path
@@ -185,12 +227,8 @@ def build_repair_plan(
             )
         )
 
-    # 按修复后路径复检：不安全条目不参与。
-    final_keys = {
-        idx: repaired_parts[idx]
-        for idx in repaired_parts
-        if not by_index[idx].unsafe
-    }
+    # 按修复后路径复检：跳过条目不参与（repaired_parts 只含活跃条目）。
+    final_keys = dict(repaired_parts)
     key_buckets: dict[tuple[str, ...], bool] = {}
     collisions_remaining = 0
     for idx in sorted(final_keys):
@@ -211,11 +249,26 @@ def build_repair_plan(
         for depth in range(1, len(parts)):
             hierarchy_remaining += len(files_by_key.get(parts[:depth], ()))
 
-    skipped_count = sum(1 for e in entries if e.unsafe)
+    skipped_unsafe = sum(1 for e in entries if e.unsafe)
+    skipped_symlink = sum(
+        1
+        for e in entries
+        if e.entry_type == EntryType.SYMLINK.value and not e.unsafe
+    )
+    skipped_hijacked = sum(
+        1
+        for e in entries
+        if not e.unsafe
+        and e.entry_type != EntryType.SYMLINK.value
+        and e.index in excluded
+    )
     return RepairPlan(
         entries=plan_entries,
         renamed_count=len(renamers),
-        skipped_count=skipped_count,
+        skipped_count=skipped_unsafe + skipped_symlink + skipped_hijacked,
+        skipped_unsafe_count=skipped_unsafe,
+        skipped_symlink_count=skipped_symlink,
+        skipped_hijacked_count=skipped_hijacked,
         collisions_remaining=collisions_remaining,
         hierarchy_conflicts_remaining=hierarchy_remaining,
         collisions_resolved=collisions_total,

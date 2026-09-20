@@ -14,9 +14,10 @@ app = FastAPI(
     title="Archive Path Preflight API",
     description=(
         "压缩包路径预检：按 Windows 目标规则规范化路径、识别保留设备名，"
-        "检测同名碰撞与文件-目录层级冲突。纯内存计算，不访问文件系统。"
+        "检测同名碰撞与文件-目录层级冲突；并对 symlink 条目做链接链追踪、"
+        "循环检测与路径劫持分析。纯内存计算，不访问文件系统。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 

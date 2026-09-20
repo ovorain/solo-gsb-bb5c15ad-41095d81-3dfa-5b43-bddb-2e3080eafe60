@@ -37,6 +37,7 @@ class IssueCode(str, Enum):
     COLLISION = "COLLISION"
     BLOCKED_BY_FILE_ANCESTOR = "BLOCKED_BY_FILE_ANCESTOR"
     BLOCKS_DESCENDANT = "BLOCKS_DESCENDANT"
+    SYMLINK_ANCESTOR = "SYMLINK_ANCESTOR"
 
 
 _ERROR_CODES = frozenset(
@@ -64,11 +65,12 @@ class Issue:
 @dataclass
 class NormalizedEntry:
     index: int
-    entry_type: str  # "file" | "directory"
+    entry_type: str  # "file" | "directory" | "symlink"
     original_path: str
     canonical_parts: list[str] = field(default_factory=list)
     key_parts: list[str] = field(default_factory=list)
     issues: list[Issue] = field(default_factory=list)
+    link_target: str | None = None  # 仅 type=symlink 时存在（原始目标字符串）
 
     @property
     def canonical_path(self) -> str:
@@ -238,3 +240,27 @@ def normalize_entry(index: int, entry_type: str, original_path: str) -> Normaliz
 
 # 供测试与 API 层使用的便捷导出。
 ERROR_CODES = _ERROR_CODES
+
+
+def is_root_form(raw_path: str) -> bool:
+    """按原始词法形态判断路径是否锚定到目标根之外。
+
+    覆盖三类：以 ``/`` 或 ``\\`` 开头（绝对/UNC）、带盘符（``C:``）。
+    符号链接目标以此判定是否拒绝按链接所在目录解析。
+    """
+    unified = raw_path.replace("\\", "/")
+    if unified.startswith("/"):
+        return True
+    return _DRIVE_RE.match(unified) is not None
+
+
+def classify_target(raw_path: str) -> set[IssueCode] | None:
+    """对符号链接目标做一次完整 Windows 规范化，返回其中出现的错误码集合。
+
+    返回 ``None`` 表示目标在目标根内合法（空串/规范化为空也视为不合法）。
+    """
+    if raw_path == "":
+        return {IssueCode.EMPTY_TARGET}
+    probe = normalize_entry(index=-1, entry_type="file", original_path=raw_path)
+    errors = {i.code for i in probe.issues if i.severity == IssueSeverity.ERROR}
+    return errors or None
